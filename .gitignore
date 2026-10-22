@@ -27,3 +27,6 @@ dev-dist
 html
 meta*.json
 .claude
+
+# self-host secrets (compose.yaml reads them)
+/.env

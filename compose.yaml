@@ -1,0 +1,94 @@
+# Self-hosted Excalidraw.  Start/refresh: docker compose up -d
+#   :3030  plain Excalidraw behind a password (EXCALIDRAW_USER / EXCALIDRAW_PASSWORD in .env)
+#   :6767  ExcaliDash: drawings stored on the server, its own accounts, collaboration, history
+name: excalidraw-selfhost
+
+services:
+  app:
+    build: .                    # this checkout's Dockerfile (production build)
+    image: excalidraw-local
+    pull_policy: build          # every `up` rebuilds from the checkout; an unchanged tree is a cache hit
+    restart: unless-stopped
+    # no "ports:", so it is reachable only through `auth`
+
+  auth:
+    image: nginx:alpine
+    restart: unless-stopped
+    depends_on: [app]
+    ports:
+      - "${EXCALIDRAW_BIND:-127.0.0.1}:${EXCALIDRAW_PORT:-3030}:80"
+    environment:
+      EXCALIDRAW_USER: ${EXCALIDRAW_USER:?set EXCALIDRAW_USER in .env}
+      EXCALIDRAW_PASSWORD: ${EXCALIDRAW_PASSWORD:?set EXCALIDRAW_PASSWORD in .env}
+    configs:
+      - source: auth_conf
+        target: /etc/nginx/conf.d/default.conf
+    # hash the password from .env into htpasswd, then hand over to the stock nginx entrypoint
+    command:
+      - sh
+      - -c
+      - |
+        printf '%s:%s\n' "$$EXCALIDRAW_USER" "$$(mkpasswd -m sha512 "$$EXCALIDRAW_PASSWORD")" > /etc/nginx/htpasswd
+        exec /docker-entrypoint.sh nginx -g 'daemon off;'
+
+  # ExcaliDash backend: the upstream image, unmodified (SQLite in the excalidash-data volume)
+  excalidash-backend:
+    image: zimengxiong/excalidash-backend:${EXCALIDASH_VERSION:-0.6.5}
+    init: true                  # reaps zombies and forwards SIGTERM so node shuts down cleanly
+    restart: unless-stopped
+    environment:
+      DATABASE_PROVIDER: sqlite
+      DATABASE_URL: file:/app/prisma/dev.db
+      PORT: "8000"
+      NODE_ENV: production
+      AUTH_MODE: local
+      TRUST_PROXY: "false"
+      JWT_SECRET: ${EXCALIDASH_JWT_SECRET:?set EXCALIDASH_JWT_SECRET in .env}
+      CSRF_SECRET: ${EXCALIDASH_CSRF_SECRET:?set EXCALIDASH_CSRF_SECRET in .env}
+    volumes:
+      - excalidash-data:/app/prisma
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:8000/health', (r) => process.exit(r.statusCode === 200 ? 0 : 1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ExcaliDash frontend, rebuilt from the same tag on a newer @excalidraw/excalidraw (see excalidash/).
+  # The tag names both versions, so changing either in .env makes `up` rebuild; otherwise no build runs.
+  excalidash:
+    build:
+      context: ./excalidash
+      dockerfile: frontend.Dockerfile
+      additional_contexts:
+        excalidash-src: https://github.com/ZimengXiong/ExcaliDash.git#v${EXCALIDASH_VERSION:-0.6.5}
+      args:
+        EXCALIDRAW_VERSION: ${EXCALIDASH_EXCALIDRAW_VERSION:-0.18.0-17d8904}
+        VITE_APP_BUILD_LABEL: ExcaliDash v${EXCALIDASH_VERSION:-0.6.5} + @excalidraw/excalidraw ${EXCALIDASH_EXCALIDRAW_VERSION:-0.18.0-17d8904}
+    image: excalidash-frontend-local:${EXCALIDASH_VERSION:-0.6.5}-excalidraw-${EXCALIDASH_EXCALIDRAW_VERSION:-0.18.0-17d8904}
+    restart: unless-stopped
+    depends_on: [excalidash-backend]
+    ports:
+      - "${EXCALIDRAW_BIND:-127.0.0.1}:${EXCALIDASH_PORT:-6767}:8080"
+    environment:
+      BACKEND_URL: excalidash-backend:8000
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:8080"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  excalidash-data:
+
+configs:
+  auth_conf:
+    content: |
+      server {
+        listen 80;
+        auth_basic           "Excalidraw";
+        auth_basic_user_file /etc/nginx/htpasswd;
+        location / {
+          proxy_pass       http://app:80;
+          proxy_set_header Host $$host;
+        }
+      }
